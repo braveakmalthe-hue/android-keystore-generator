@@ -10,6 +10,8 @@ import {
 } from "react";
 import { pki, md, asn1, pkcs12 } from "node-forge";
 import type { pki as ForgePki } from "node-forge";
+import { createJksKeystore } from "@/lib/jks";
+import { ThemeToggle } from "./ThemeToggle";
 import {
   AlertTriangle,
   Check,
@@ -32,7 +34,10 @@ import {
 /* Types                                                               */
 /* ------------------------------------------------------------------ */
 
+type KeystoreFormat = "pkcs12" | "jks";
+
 type FormState = {
+  format: KeystoreFormat;
   alias: string;
   password: string;
   validityYears: number;
@@ -48,6 +53,7 @@ type FormErrors = Partial<Record<keyof FormState, string>>;
 
 type OutputState = {
   filename: string;
+  format: KeystoreFormat;
   sha1Fingerprint: string;
   sha256Fingerprint: string;
   alias: string;
@@ -63,7 +69,33 @@ const MIN_VALIDITY_YEARS = 25;
 const MAX_VALIDITY_YEARS = 100;
 const DEFAULT_VALIDITY_YEARS = 30;
 
+const FORMAT_MIME: Record<KeystoreFormat, string> = {
+  pkcs12: "application/x-pkcs12",
+  jks: "application/octet-stream",
+};
+
+const FORMAT_OPTIONS: Array<{
+  value: KeystoreFormat;
+  label: string;
+  extension: string;
+  description: string;
+}> = [
+  {
+    value: "pkcs12",
+    label: "PKCS#12",
+    extension: ".keystore",
+    description: "Modern default — Java 9+, Android Studio",
+  },
+  {
+    value: "jks",
+    label: "JKS",
+    extension: ".jks",
+    description: "Legacy — Java 8, older toolchains",
+  },
+];
+
 const INITIAL_FORM: FormState = {
+  format: "pkcs12",
   alias: "upload-key",
   password: "",
   validityYears: DEFAULT_VALIDITY_YEARS,
@@ -77,6 +109,7 @@ const INITIAL_FORM: FormState = {
 
 const INITIAL_OUTPUT: OutputState = {
   filename: "",
+  format: "pkcs12",
   sha1Fingerprint: "",
   sha256Fingerprint: "",
   alias: "",
@@ -95,6 +128,33 @@ function sanitizeFilename(raw: string): string {
     .replace(/-{2,}/g, "-")
     .replace(/^[-.]+|[-.]+$/g, "");
   return cleaned.length > 0 ? cleaned : "keystore";
+}
+
+/** Build the download filename for the given alias and keystore format. */
+function keystoreFilename(alias: string, format: KeystoreFormat): string {
+  return `${sanitizeFilename(alias)}.${format === "jks" ? "jks" : "keystore"}`;
+}
+
+/** Single source of truth for the Gradle signing preview and its clipboard copy. */
+function buildGradleSnippet(filename: string, alias: string, format: KeystoreFormat): string {
+  const lines = [
+    "android {",
+    "    signingConfigs {",
+    "        release {",
+    `            storeFile file("${filename}")`,
+    '            storePassword "••••••••"',
+  ];
+  if (format === "jks") {
+    lines.push('            storeType "JKS"');
+  }
+  lines.push(
+    `            keyAlias "${alias}"`,
+    '            keyPassword "••••••••"',
+    "        }",
+    "    }",
+    "}",
+  );
+  return lines.join("\n");
 }
 
 /** Split a DER byte buffer into uppercase colon-separated hex pairs. */
@@ -132,9 +192,9 @@ function buildNameAttributes(form: FormState): ForgePki.CertificateField[] {
  * 1. RSA-2048 key pair generation (forge.pki.rsa.generateKeyPair)
  * 2. Self-signed X.509 certificate, signed with SHA-256
  * 3. Certificate DER encoding → SHA-1 / SHA-256 fingerprints
- * 4. PKCS#12 container (key + cert, password protected) → DER → Uint8Array
+ * 4. Keystore container — PKCS#12 or legacy JKS (key + cert, password protected)
  *
- * Returns the DER-encoded PKCS#12 bytes plus display metadata.
+ * Returns the keystore bytes plus display metadata.
  * Never logs or retains key material beyond the lifetime of this function.
  */
 function runCryptoPipeline(form: FormState): { bytes: Uint8Array; metadata: OutputState } {
@@ -179,20 +239,31 @@ function runCryptoPipeline(form: FormState): { bytes: Uint8Array; metadata: Outp
   const sha1Fingerprint = formatHexFingerprint(sha1.digest().toHex());
   const sha256Fingerprint = formatHexFingerprint(sha256.digest().toHex());
 
-  // 4. PKCS#12 container, with the alias stored as the bag's friendlyName
-  // so Android/Gradle `keyAlias` lookups resolve correctly.
-  const p12Asn1 = pkcs12.toPkcs12Asn1(keyPair.privateKey, certificate, form.password, {
-    friendlyName: form.alias.trim(),
-  });
-  const p12Der = asn1.toDer(p12Asn1).getBytes();
+  // 4. Container: PKCS#12 (alias stored as the bag's friendlyName so
+  // Android/Gradle `keyAlias` lookups resolve correctly) or legacy JKS.
+  const alias = form.alias.trim();
+  let bytes: Uint8Array;
+  if (form.format === "jks") {
+    bytes = createJksKeystore({
+      privateKey: keyPair.privateKey,
+      certificateDer: certDer,
+      alias,
+      password: form.password,
+    });
+  } else {
+    const p12Asn1 = pkcs12.toPkcs12Asn1(keyPair.privateKey, certificate, form.password, {
+      friendlyName: alias,
+    });
+    const p12Der = asn1.toDer(p12Asn1).getBytes();
 
-  // Copy DER bytes out of the forge buffer before returning.
-  const bytes = new Uint8Array(new ArrayBuffer(p12Der.length));
-  for (let i = 0; i < p12Der.length; i++) {
-    bytes[i] = p12Der.charCodeAt(i);
+    // Copy DER bytes out of the forge buffer before returning.
+    bytes = new Uint8Array(new ArrayBuffer(p12Der.length));
+    for (let i = 0; i < p12Der.length; i++) {
+      bytes[i] = p12Der.charCodeAt(i);
+    }
   }
 
-  const filename = `${sanitizeFilename(form.alias)}.keystore`;
+  const filename = keystoreFilename(alias, form.format);
 
   return {
     bytes,
@@ -200,16 +271,17 @@ function runCryptoPipeline(form: FormState): { bytes: Uint8Array; metadata: Outp
       filename,
       sha1Fingerprint,
       sha256Fingerprint,
-      alias: form.alias.trim(),
+      alias,
       validityYears: form.validityYears,
+      format: form.format,
     },
   };
 }
 
 /** Trigger a client-side Blob download and always revoke the object URL. */
-function downloadKeystore(bytes: Uint8Array, filename: string): void {
+function downloadKeystore(bytes: Uint8Array, filename: string, mimeType: string): void {
   const blob = new Blob([bytes.buffer as ArrayBuffer], {
-    type: "application/x-pkcs12",
+    type: mimeType,
   });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -279,8 +351,8 @@ function CopyButton({
       type="button"
       onClick={() => onCopy(target)}
       aria-label={ariaLabel}
-      className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-slate-800/60 px-2.5 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-slate-700/60 hover:text-white focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none ${
-        copied ? "text-emerald-400" : ""
+      className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-input px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${
+        copied ? "text-success" : ""
       } ${className}`}
     >
       {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
@@ -304,17 +376,17 @@ function FieldShell({
 }) {
   return (
     <div className="flex flex-col gap-1.5">
-      <label htmlFor={htmlFor} className="text-sm font-medium text-slate-200">
+      <label htmlFor={htmlFor} className="text-sm font-medium text-foreground">
         {label}
       </label>
       {children}
       {error ? (
-        <p role="alert" className="flex items-center gap-1.5 text-xs text-red-400">
+        <p role="alert" className="flex items-center gap-1.5 text-xs text-destructive">
           <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
           {error}
         </p>
       ) : hint ? (
-        <p className="text-xs text-slate-500">{hint}</p>
+        <p className="text-xs text-muted-foreground">{hint}</p>
       ) : null}
     </div>
   );
@@ -338,14 +410,11 @@ export function KeystoreGenerator() {
   const [status, setStatus] = useState<StatusMessage | null>(null);
 
   const copyTimerRef = useRef<number | null>(null);
-  const statusTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const copyTimer = copyTimerRef;
-    const statusTimer = statusTimerRef;
     return () => {
       if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
-      if (statusTimer.current !== null) window.clearTimeout(statusTimer.current);
     };
   }, []);
 
@@ -377,6 +446,13 @@ export function KeystoreGenerator() {
     setShowPassword((prev) => !prev);
   }, []);
 
+  // Gradle snippet inputs: mirror the generated file once one exists, and the
+  // current form selection before that.
+  const previewFormat: KeystoreFormat = output.filename ? output.format : form.format;
+  const previewFilename =
+    generatedFilename || keystoreFilename(form.alias.trim() || "upload-key", previewFormat);
+  const previewAlias = output.alias || form.alias.trim() || "upload-key";
+
   const handleGenerate = useCallback(() => {
     const validationErrors = validateForm(form);
     if (Object.keys(validationErrors).length > 0) {
@@ -397,7 +473,7 @@ export function KeystoreGenerator() {
       try {
         const { bytes, metadata } = runCryptoPipeline(form);
 
-        downloadKeystore(bytes, metadata.filename);
+        downloadKeystore(bytes, metadata.filename, FORMAT_MIME[metadata.format]);
 
         setOutput(metadata);
         setGeneratedFilename(metadata.filename);
@@ -434,18 +510,7 @@ export function KeystoreGenerator() {
       } else if (target === "sha256") {
         text = output.sha256Fingerprint;
       } else {
-        text = [
-          "android {",
-          "    signingConfigs {",
-          "        release {",
-          `            storeFile file("${generatedFilename || "upload-key.keystore"}")`,
-          '            storePassword "••••••••"',
-          `            keyAlias "${output.alias || "upload-key"}"`,
-          '            keyPassword "••••••••"',
-          "        }",
-          "    }",
-          "}",
-        ].join("\n");
+        text = buildGradleSnippet(previewFilename, previewAlias, previewFormat);
       }
 
       try {
@@ -458,7 +523,13 @@ export function KeystoreGenerator() {
         setStatus({ kind: "error", text: "Clipboard access failed. Select the value and copy it manually." });
       }
     },
-    [output.sha1Fingerprint, output.sha256Fingerprint, output.alias, generatedFilename],
+    [
+      output.sha1Fingerprint,
+      output.sha256Fingerprint,
+      previewAlias,
+      previewFormat,
+      previewFilename,
+    ],
   );
 
   const handleReset = useCallback(() => {
@@ -472,57 +543,102 @@ export function KeystoreGenerator() {
   }, []);
 
   return (
-    <div className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6 lg:px-8">
+    <div className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
       {/* ---------------- Header ---------------- */}
-      <header className="mb-8">
+      <header className="mb-6 sm:mb-8">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-          <div className="flex items-start gap-4">
-            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-blue-500/30 bg-blue-500/10">
-              <Lock className="h-6 w-6 text-blue-400" aria-hidden="true" />
+          <div className="flex items-start gap-3 sm:gap-4">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-primary/30 bg-primary/10 sm:h-12 sm:w-12">
+              <Lock className="h-5 w-5 text-primary sm:h-6 sm:w-6" aria-hidden="true" />
             </div>
             <div>
-              <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl">
+              <h1 className="text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">
                 Android Keystore Generator
               </h1>
-              <p className="mt-1 text-sm text-slate-400">
+              <p className="mt-1 text-sm text-muted-foreground">
                 Create a signing keystore for your Android app — right in your browser.
               </p>
             </div>
           </div>
-          <span className="inline-flex w-fit items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-1.5 text-xs font-medium text-emerald-400">
-            <ShieldCheck className="h-4 w-4" aria-hidden="true" />
-            100% Client-Side
-          </span>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="inline-flex w-fit items-center gap-2 rounded-full border border-success/30 bg-success/10 px-3.5 py-1.5 text-xs font-medium text-success-foreground">
+              <ShieldCheck className="h-4 w-4" aria-hidden="true" />
+              100% Client-Side
+            </span>
+            <ThemeToggle />
+          </div>
         </div>
 
         {/* Security notice */}
         <div
           role="note"
           aria-label="Security notice"
-          className="mt-6 flex items-start gap-3 rounded-xl border border-emerald-500/20 bg-emerald-500/5 px-4 py-3"
+          className="mt-6 flex items-start gap-3 rounded-xl border border-success/20 bg-success/5 px-4 py-3"
         >
-          <Lock className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" aria-hidden="true" />
-          <p className="text-sm text-emerald-300/90">
+          <Lock className="mt-0.5 h-4 w-4 shrink-0 text-success" aria-hidden="true" />
+          <p className="text-sm text-success-foreground">
             <span className="font-semibold">🔒 100% Client-Side</span> — Your private key and
             password never leave this browser. All cryptography runs locally on your device.
           </p>
         </div>
       </header>
 
-      <div className="grid gap-6 lg:grid-cols-5">
+      <div className="grid gap-4 sm:gap-6 lg:grid-cols-5">
         {/* ---------------- Configuration card ---------------- */}
         <section
           aria-labelledby="config-heading"
-          className="rounded-2xl border border-border bg-card p-6 shadow-xl shadow-black/20 lg:col-span-3"
+          className="rounded-2xl border border-border bg-card p-4 shadow-xl shadow-black/5 sm:p-6 lg:col-span-3 dark:shadow-black/30"
         >
           <div className="mb-6 flex items-center gap-3">
-            <KeyRound className="h-5 w-5 text-blue-400" aria-hidden="true" />
-            <h2 id="config-heading" className="text-lg font-semibold text-white">
+            <KeyRound className="h-5 w-5 text-primary" aria-hidden="true" />
+            <h2 id="config-heading" className="text-lg font-semibold text-foreground">
               Configuration
             </h2>
           </div>
 
           <div className="grid gap-5 sm:grid-cols-2">
+            <div className="sm:col-span-2">
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium text-foreground">Keystore Format</span>
+                <div
+                  role="radiogroup"
+                  aria-label="Keystore format"
+                  className="grid grid-cols-1 gap-2 sm:grid-cols-2"
+                >
+                  {FORMAT_OPTIONS.map((option) => {
+                    const selected = form.format === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => setField("format", option.value)}
+                        className={`flex flex-col items-start gap-1 rounded-lg border px-3.5 py-2.5 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${
+                          selected
+                            ? "border-primary bg-primary/10 text-foreground"
+                            : "border-border bg-input text-muted-foreground hover:bg-accent hover:text-foreground"
+                        }`}
+                      >
+                        <span className="text-sm font-semibold">
+                          {option.label}{" "}
+                          <span className="font-mono text-xs font-normal opacity-70">
+                            {option.extension}
+                          </span>
+                        </span>
+                        <span className="text-xs opacity-70">{option.description}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {form.format === "jks"
+                    ? "Legacy proprietary format for Java 8 and older toolchains. Uses weak SHA-1-based key protection — prefer PKCS#12 unless you need it."
+                    : "Industry standard, default since Java 9. Recommended for new keystores."}
+                </p>
+              </div>
+            </div>
+
             <FieldShell
               label="Key Alias"
               htmlFor="alias"
@@ -537,7 +653,7 @@ export function KeystoreGenerator() {
                 autoComplete="off"
                 spellCheck={false}
                 aria-invalid={errors.alias ? true : undefined}
-                className="w-full rounded-lg border border-border bg-slate-800/50 px-3 py-2.5 text-sm text-white placeholder-slate-500 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                className="w-full rounded-lg border border-border bg-input px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 placeholder="upload-key"
               />
             </FieldShell>
@@ -556,14 +672,14 @@ export function KeystoreGenerator() {
                   onChange={handleInputChange("password")}
                   autoComplete="new-password"
                   aria-invalid={errors.password ? true : undefined}
-                  className="w-full rounded-lg border border-border bg-slate-800/50 px-3 py-2.5 pr-11 text-sm text-white placeholder-slate-500 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                  className="w-full rounded-lg border border-border bg-input px-3 py-2.5 pr-11 text-sm text-foreground placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                   placeholder="••••••••"
                 />
                 <button
                   type="button"
                   onClick={toggleShowPassword}
                   aria-label={showPassword ? "Hide password" : "Show password"}
-                  className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-slate-500 hover:text-slate-300 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                  className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 >
                   {showPassword ? (
                     <EyeOff className="h-4 w-4" aria-hidden="true" />
@@ -591,12 +707,12 @@ export function KeystoreGenerator() {
                     value={form.validityYears}
                     onChange={handleValidityChange}
                     aria-describedby="validity-display"
-                    className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-slate-700 accent-blue-500"
+                    className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted-foreground/40 accent-primary"
                   />
                   <span
                     id="validity-display"
                     aria-hidden="true"
-                    className="w-12 shrink-0 rounded-md border border-border bg-slate-800/50 py-1 text-center font-mono text-sm text-blue-400"
+                    className="w-12 shrink-0 rounded-md border border-border bg-input py-1 text-center font-mono text-sm text-primary"
                   >
                     {form.validityYears}
                   </span>
@@ -617,7 +733,7 @@ export function KeystoreGenerator() {
                 onChange={handleInputChange("commonName")}
                 autoComplete="off"
                 aria-invalid={errors.commonName ? true : undefined}
-                className="w-full rounded-lg border border-border bg-slate-800/50 px-3 py-2.5 text-sm text-white placeholder-slate-500 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                className="w-full rounded-lg border border-border bg-input px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 placeholder="John Doe"
               />
             </FieldShell>
@@ -633,7 +749,7 @@ export function KeystoreGenerator() {
                 value={form.organizationalUnit}
                 onChange={handleInputChange("organizationalUnit")}
                 autoComplete="off"
-                className="w-full rounded-lg border border-border bg-slate-800/50 px-3 py-2.5 text-sm text-white placeholder-slate-500 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                className="w-full rounded-lg border border-border bg-input px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 placeholder="Engineering"
               />
             </FieldShell>
@@ -649,7 +765,7 @@ export function KeystoreGenerator() {
                 value={form.organization}
                 onChange={handleInputChange("organization")}
                 autoComplete="off"
-                className="w-full rounded-lg border border-border bg-slate-800/50 px-3 py-2.5 text-sm text-white placeholder-slate-500 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                className="w-full rounded-lg border border-border bg-input px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 placeholder="Acme Corp"
               />
             </FieldShell>
@@ -661,7 +777,7 @@ export function KeystoreGenerator() {
                 value={form.locality}
                 onChange={handleInputChange("locality")}
                 autoComplete="off"
-                className="w-full rounded-lg border border-border bg-slate-800/50 px-3 py-2.5 text-sm text-white placeholder-slate-500 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                className="w-full rounded-lg border border-border bg-input px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 placeholder="San Francisco"
               />
             </FieldShell>
@@ -677,7 +793,7 @@ export function KeystoreGenerator() {
                 value={form.state}
                 onChange={handleInputChange("state")}
                 autoComplete="off"
-                className="w-full rounded-lg border border-border bg-slate-800/50 px-3 py-2.5 text-sm text-white placeholder-slate-500 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                className="w-full rounded-lg border border-border bg-input px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 placeholder="California"
               />
             </FieldShell>
@@ -696,7 +812,7 @@ export function KeystoreGenerator() {
                 autoComplete="country"
                 maxLength={2}
                 aria-invalid={errors.country ? true : undefined}
-                className="w-full rounded-lg border border-border bg-slate-800/50 px-3 py-2.5 font-mono text-sm tracking-widest text-white uppercase placeholder-slate-500 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                className="w-full rounded-lg border border-border bg-input px-3 py-2.5 font-mono text-sm tracking-widest text-foreground uppercase placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 placeholder="US"
               />
             </FieldShell>
@@ -704,9 +820,9 @@ export function KeystoreGenerator() {
         </section>
 
         {/* ---------------- Sidebar ---------------- */}
-        <div className="flex flex-col gap-6 lg:col-span-2">
+        <div className="flex flex-col gap-4 sm:gap-6 lg:col-span-2">
           {/* Generate section */}
-          <section aria-labelledby="generate-heading" className="rounded-2xl border border-border bg-card p-6">
+          <section aria-labelledby="generate-heading" className="rounded-2xl border border-border bg-card p-4 sm:p-6">
             <h2 id="generate-heading" className="sr-only">
               Generate keystore
             </h2>
@@ -714,22 +830,22 @@ export function KeystoreGenerator() {
             {error && (
               <div
                 role="alert"
-                className="mb-4 flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3"
+                className="mb-4 flex items-start gap-3 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3"
               >
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" aria-hidden="true" />
-                <p className="text-sm text-red-300">{error}</p>
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden="true" />
+                <p className="text-sm text-destructive-foreground">{error}</p>
               </div>
             )}
 
             {isSuccess && !isGenerating && (
               <div
                 role="status"
-                className="mb-4 flex items-start gap-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3"
+                className="mb-4 flex items-start gap-3 rounded-xl border border-success/30 bg-success/10 px-4 py-3"
               >
-                <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" aria-hidden="true" />
-                <div className="text-sm text-emerald-300">
+                <Check className="mt-0.5 h-4 w-4 shrink-0 text-success" aria-hidden="true" />
+                <div className="text-sm text-success-foreground">
                   <p className="font-medium">✓ Keystore generated successfully</p>
-                  <p className="mt-0.5 font-mono text-xs text-emerald-400/80">
+                  <p className="mt-0.5 font-mono text-xs break-all text-success-foreground/80">
                     {generatedFilename}
                   </p>
                 </div>
@@ -741,7 +857,7 @@ export function KeystoreGenerator() {
                 type="button"
                 onClick={handleGenerate}
                 disabled={isGenerating}
-                className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-blue-600 px-6 text-sm font-semibold text-white transition-colors hover:bg-blue-500 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-[#18181b] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary px-6 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {isGenerating ? (
                   <>
@@ -759,7 +875,7 @@ export function KeystoreGenerator() {
                 <button
                   type="button"
                   onClick={handleReset}
-                  className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-border bg-slate-800/50 px-6 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700/50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                  className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-border bg-input px-6 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
                 >
                   <RotateCcw className="h-4 w-4" aria-hidden="true" />
                   Reset form
@@ -770,12 +886,14 @@ export function KeystoreGenerator() {
             {output.filename && (
               <dl className="mt-5 space-y-2 border-t border-border pt-4 text-sm">
                 <div className="flex items-center justify-between gap-3">
-                  <dt className="text-slate-500">Format</dt>
-                  <dd className="font-mono text-xs text-slate-300">PKCS#12</dd>
+                  <dt className="text-muted-foreground">Format</dt>
+                  <dd className="font-mono text-xs text-foreground">
+                      {output.format === "jks" ? "JKS" : "PKCS#12"}
+                    </dd>
                 </div>
                 <div className="flex items-center justify-between gap-3">
-                  <dt className="text-slate-500">File</dt>
-                  <dd className="truncate font-mono text-xs text-slate-300">{output.filename}</dd>
+                  <dt className="text-muted-foreground">File</dt>
+                  <dd className="truncate font-mono text-xs text-foreground">{output.filename}</dd>
                 </div>
               </dl>
             )}
@@ -784,11 +902,11 @@ export function KeystoreGenerator() {
           {/* Integrity / output */}
           <section
             aria-labelledby="integrity-heading"
-            className="rounded-2xl border border-border bg-card p-6"
+            className="rounded-2xl border border-border bg-card p-4 sm:p-6"
           >
             <div className="mb-5 flex items-center gap-3">
-              <Cpu className="h-5 w-5 text-blue-400" aria-hidden="true" />
-              <h2 id="integrity-heading" className="text-lg font-semibold text-white">
+              <Cpu className="h-5 w-5 text-primary" aria-hidden="true" />
+              <h2 id="integrity-heading" className="text-lg font-semibold text-foreground">
                 Integrity &amp; Output
               </h2>
             </div>
@@ -796,11 +914,11 @@ export function KeystoreGenerator() {
             {output.sha1Fingerprint ? (
               <div className="space-y-5">
                 <div>
-                  <p className="mb-1.5 text-xs font-medium tracking-wide text-slate-400 uppercase">
+                  <p className="mb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
                     SHA-1 Fingerprint
                   </p>
-                  <div className="flex items-start justify-between gap-2 rounded-lg border border-border bg-slate-800/50 p-3">
-                    <code className="font-mono text-xs leading-relaxed break-all text-emerald-400 select-all">
+                  <div className="flex flex-col gap-2 rounded-lg border border-border bg-input p-3 sm:flex-row sm:items-start sm:justify-between">
+                    <code className="font-mono text-xs leading-relaxed break-all text-success-foreground select-all">
                       {output.sha1Fingerprint}
                     </code>
                     <CopyButton
@@ -813,11 +931,11 @@ export function KeystoreGenerator() {
                 </div>
 
                 <div>
-                  <p className="mb-1.5 text-xs font-medium tracking-wide text-slate-400 uppercase">
+                  <p className="mb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
                     SHA-256 Fingerprint
                   </p>
-                  <div className="flex items-start justify-between gap-2 rounded-lg border border-border bg-slate-800/50 p-3">
-                    <code className="font-mono text-xs leading-relaxed break-all text-emerald-400 select-all">
+                  <div className="flex flex-col gap-2 rounded-lg border border-border bg-input p-3 sm:flex-row sm:items-start sm:justify-between">
+                    <code className="font-mono text-xs leading-relaxed break-all text-success-foreground select-all">
                       {output.sha256Fingerprint}
                     </code>
                     <CopyButton
@@ -831,42 +949,54 @@ export function KeystoreGenerator() {
 
                 <dl className="space-y-2 border-t border-border pt-4 text-sm">
                   <div className="flex items-center justify-between gap-3">
-                    <dt className="text-slate-500">Algorithm</dt>
-                    <dd className="font-mono text-xs text-slate-300">RSA 2048</dd>
+                    <dt className="text-muted-foreground">Algorithm</dt>
+                    <dd className="font-mono text-xs text-foreground">RSA 2048</dd>
                   </div>
                   <div className="flex items-center justify-between gap-3">
-                    <dt className="text-slate-500">Signature</dt>
-                    <dd className="font-mono text-xs text-slate-300">SHA-256</dd>
+                    <dt className="text-muted-foreground">Signature</dt>
+                    <dd className="font-mono text-xs text-foreground">SHA-256</dd>
                   </div>
                   <div className="flex items-center justify-between gap-3">
-                    <dt className="text-slate-500">Format</dt>
-                    <dd className="font-mono text-xs text-slate-300">PKCS#12</dd>
+                    <dt className="text-muted-foreground">Format</dt>
+                    <dd className="font-mono text-xs text-foreground">
+                      {output.format === "jks" ? "JKS" : "PKCS#12"}
+                    </dd>
                   </div>
                   <div className="flex items-center justify-between gap-3">
-                    <dt className="text-slate-500">Validity</dt>
-                    <dd className="font-mono text-xs text-slate-300">
+                    <dt className="text-muted-foreground">Validity</dt>
+                    <dd className="font-mono text-xs text-foreground">
                       {output.validityYears} years
                     </dd>
                   </div>
                   <div className="flex items-center justify-between gap-3">
-                    <dt className="text-slate-500">Alias</dt>
-                    <dd className="truncate font-mono text-xs text-slate-300">{output.alias}</dd>
+                    <dt className="text-muted-foreground">Alias</dt>
+                    <dd className="truncate font-mono text-xs text-foreground">{output.alias}</dd>
                   </div>
                 </dl>
               </div>
             ) : (
-              <p className="rounded-lg border border-dashed border-border bg-slate-800/30 px-4 py-6 text-center text-sm text-slate-500">
+              <p className="rounded-lg border border-dashed border-border bg-muted px-4 py-6 text-center text-sm text-muted-foreground">
                 Fingerprints and certificate details will appear here after generation.
               </p>
             )}
 
-            <div className="mt-5 flex items-start gap-2.5 rounded-lg border border-blue-500/20 bg-blue-500/5 px-3.5 py-3">
-              <Info className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" aria-hidden="true" />
-              <p className="text-xs leading-relaxed text-blue-300/80">
-                The <code className="font-mono">.keystore</code> file is a{" "}
-                <strong>PKCS#12</strong> container. Modern Java tooling (including Android
-                Studio and Gradle) uses PKCS#12 as the default keystore format, so it works
-                directly with <code className="font-mono">signingConfigs</code>.
+            <div className="mt-5 flex items-start gap-2.5 rounded-lg border border-primary/20 bg-primary/5 px-3.5 py-3">
+              <Info className="mt-0.5 h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
+              <p className="text-xs leading-relaxed text-primary/90">
+                {output.format === "jks" ? (
+                  <>
+                    The <code className="font-mono">.jks</code> file is a legacy{" "}
+                    <strong>Sun JKS</strong> container. It is required by Java 8 and older
+                    toolchains; prefer PKCS#12 on modern Java (9+).
+                  </>
+                ) : (
+                  <>
+                    The <code className="font-mono">.keystore</code> file is a{" "}
+                    <strong>PKCS#12</strong> container. Modern Java tooling (including Android
+                    Studio and Gradle) uses PKCS#12 as the default keystore format, so it works
+                    directly with <code className="font-mono">signingConfigs</code>.
+                  </>
+                )}
               </p>
             </div>
           </section>
@@ -874,10 +1004,10 @@ export function KeystoreGenerator() {
           {/* Gradle preview */}
           <section
             aria-labelledby="gradle-heading"
-            className="rounded-2xl border border-border bg-card p-6"
+            className="rounded-2xl border border-border bg-card p-4 sm:p-6"
           >
             <div className="mb-4 flex items-center justify-between gap-3">
-              <h2 id="gradle-heading" className="text-lg font-semibold text-white">
+              <h2 id="gradle-heading" className="text-lg font-semibold text-foreground">
                 Android Gradle Preview
               </h2>
               <CopyButton
@@ -887,21 +1017,10 @@ export function KeystoreGenerator() {
                 ariaLabel="Copy Gradle signing configuration to clipboard"
               />
             </div>
-            <pre className="overflow-x-auto rounded-lg border border-border bg-slate-950/70 p-4 font-mono text-xs leading-relaxed text-slate-300">
-              <code>
-                {`android {
-    signingConfigs {
-        release {
-            storeFile file("${generatedFilename || "upload-key.keystore"}")
-            storePassword "••••••••"
-            keyAlias "${output.alias || form.alias.trim() || "upload-key"}"
-            keyPassword "••••••••"
-        }
-    }
-}`}
-              </code>
+            <pre className="overflow-x-auto rounded-lg border border-border bg-muted p-4 font-mono text-xs leading-relaxed text-foreground">
+              <code>{buildGradleSnippet(previewFilename, previewAlias, previewFormat)}</code>
             </pre>
-            <p className="mt-3 flex items-start gap-2 text-xs text-slate-500">
+            <p className="mt-3 flex items-start gap-2 text-xs text-muted-foreground">
               <FileDown className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               Passwords are masked for safety — replace the dots with your real passwords in
               gradle.properties or your CI secrets, never in this file.
@@ -921,7 +1040,7 @@ export function KeystoreGenerator() {
 
       {/* Acknowledged error banner lives in the generate card; keep a
           persistent footer note for privacy. */}
-      <footer className="mt-10 border-t border-border pt-6 pb-4 text-center text-xs text-slate-600">
+      <footer className="mt-10 border-t border-border pt-6 pb-4 text-center text-xs text-muted-foreground">
         All cryptographic operations run locally in your browser. No uploads, no servers, no
         telemetry.
       </footer>
